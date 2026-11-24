@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RdpNet Management Dashboard</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-area">
+                <span class="logo-icon">🛡️</span>
+                <div>
+                    <h1>RdpNet Relay Server</h1>
+                    <div class="header-status">
+                        <span class="status-dot"></span> Core Relay &amp; Tunnel Active
+                    </div>
+                </div>
+            </div>
+            <div>
+                <button class="btn btn-primary" id="btn-new-net">+ New Network</button>
+            </div>
+        </header>
+
+        <section class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Isolated Networks</div>
+                <div class="stat-value" id="stat-networks">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Online RDP Hosts</div>
+                <div class="stat-value" id="stat-hosts" style="color: var(--accent);">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Active Viewers</div>
+                <div class="stat-value" id="stat-viewers" style="color: var(--warning);">0</div>
+            </div>
+        </section>
+
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="networks">Virtual Networks</button>
+            <button class="tab-btn" data-tab="nodes">Connected Devices</button>
+        </div>
+
+        <main>
+            <!-- Networks View -->
+            <div id="networks-view">
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Network Name</th>
+                                <th>Network ID</th>
+                                <th>Pre-Shared Key (Token)</th>
+                                <th>Hosts</th>
+                                <th>Viewers</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="networks-tbody">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Nodes View -->
+            <div id="nodes-view" style="display: none;">
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Device Name</th>
+                                <th>Network</th>
+                                <th>Role</th>
+                                <th>Remote IP</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="nodes-tbody">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal: Create Network -->
+    <div class="modal" id="modal-create-net">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Create Isolated Network</h3>
+                <button class="modal-close" onclick="closeModal('modal-create-net')">&times;</button>
+            </div>
+            <form id="form-create-net">
+                <div class="form-group">
+                    <label for="net-name-input">Network Name</label>
+                    <input type="text" id="net-name-input" placeholder="e.g. Office PCs, Home Servers" required>
+                </div>
+                <div class="form-group">
+                    <label for="net-token-input">Secret Key / Token (optional, auto-generated if blank)</label>
+                    <input type="text" id="net-token-input" placeholder="Custom secret or leave empty">
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px;">
+                    <button type="button" class="btn" style="background: var(--border); color: white;" onclick="closeModal('modal-create-net')">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Network</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal: Connect Snippet -->
+    <div class="modal" id="modal-connect">
+        <div class="modal-content" style="max-width: 680px;">
+            <div class="modal-header">
+                <h3 class="modal-title">Connect Devices to Network</h3>
+                <button class="modal-close" onclick="closeModal('modal-connect')">&times;</button>
+            </div>
+            <div>
+                <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 12px;">
+                    Run <code>rdp-agent.exe</code> on your Windows machines with the parameters below:
+                </p>
+
+                <label>1. Target Computer (Exposes local RDP 3389):</label>
+                <div class="code-block">
+                    <button class="copy-btn" onclick="copyCode('snippet-host-cmd')">Copy</button>
+                    <span id="snippet-host-cmd"></span>
+                </div>
+
+                <label>2. Controlling Computer (Viewer for mstsc.exe):</label>
+                <div class="code-block">
+                    <button class="copy-btn" onclick="copyCode('snippet-viewer-cmd')">Copy</button>
+                    <span id="snippet-viewer-cmd"></span>
+                </div>
+
+                <div style="margin-top: 16px; display: flex; justify-content: space-between; align-items: center;">
+                    <button class="btn btn-primary" id="snippet-dl-ini">📥 Download rdp-agent.ini</button>
+                    <button type="button" class="btn" style="background: var(--border); color: white;" onclick="closeModal('modal-connect')">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>
