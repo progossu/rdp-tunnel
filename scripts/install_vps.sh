@@ -26,8 +26,16 @@ fi
 
 # Install Python 3 if missing
 echo -e "${YELLOW}[*] Checking Python 3 dependencies...${NC}"
-apt-get update -qq
-apt-get install -y -qq python3 python3-pip curl
+if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+    echo -e "${GREEN}[✓] Python 3 and curl are already installed.${NC}"
+else
+    echo -e "${YELLOW}[*] Waiting for background apt process to release lock...${NC}"
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        sleep 2
+    done
+    apt-get update -qq
+    apt-get install -y -qq python3 curl
+fi
 
 INSTALL_DIR="/opt/rdpnet"
 echo -e "${YELLOW}[*] Installing RdpNet into ${INSTALL_DIR}...${NC}"
