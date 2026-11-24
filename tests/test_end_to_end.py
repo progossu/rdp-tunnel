@@ -283,3 +283,53 @@ async def test_standalone_native_exe_e2e(tmp_path):
 
 
 
+
+
+@pytest.mark.asyncio
+async def test_native_exe_cwd_ini_in_cyrillic_path(tmp_path):
+    """Reproduces start_host.bat: runs rdp-agent.exe with NO CLI args in a Cyrillic subfolder containing rdp-agent.ini."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    exe_src = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "client", "rdp-agent.exe"))
+    if sys.platform != "win32" or not os.path.isfile(exe_src):
+        pytest.skip("Windows native rdp-agent.exe test only runs on Windows")
+
+    storage = str(tmp_path / "test_cyrillic.json")
+    registry = NetworkRegistry(storage)
+    net = registry.create_network("CyrillicNet", "sec_cyr_999")
+
+    relay = RelayServer("127.0.0.1", 0, registry)
+    await relay.start()
+
+    run_dir = tmp_path / "Документы" / "rdp-agent"
+    run_dir.mkdir(parents=True)
+    exe_dst = run_dir / "rdp-agent.exe"
+    shutil.copy2(exe_src, exe_dst)
+
+    (run_dir / "rdp-agent.ini").write_text(
+        f"[server]\r\naddress=127.0.0.1:{relay.port}\r\n\r\n"
+        f"[network]\r\nid={net.id}\r\nkey=sec_cyr_999\r\n\r\n"
+        f"[node]\r\nrole=host\r\nname=CyrillicHost\r\nrdp_port=auto\r\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.Popen(
+        [str(exe_dst)],
+        cwd=str(run_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        for _ in range(40):
+            if "CyrillicHost" in relay.active_hosts.get(net.id, {}):
+                break
+            await asyncio.sleep(0.1)
+
+        assert "CyrillicHost" in relay.active_hosts.get(net.id, {}), "Host failed to load rdp-agent.ini from Cyrillic CWD"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=3)
+        await relay.stop()

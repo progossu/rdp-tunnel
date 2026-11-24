@@ -1233,7 +1233,8 @@ endp
 
 proc resolve_config_path
     locals
-        i dd 1
+        i       dd 1
+        tmp_buf db 512 dup (0)
     endl
     ; Check -config flag first
     mov     dword [i], 1
@@ -1250,30 +1251,38 @@ proc resolve_config_path
     mov     ebx, [i]
     inc     ebx
     mov     edx, [argv + ebx*4]
-    cinvoke strncpy, config_path, edx, 500
+    ; Resolve to full absolute path (GetPrivateProfileStringA requires a path!)
+    invoke  GetFullPathNameA, edx, 500, config_path, 0
     ret
 .next_i:
     inc     dword [i]
     jmp     .cli_chk
 
 .check_cwd:
-    invoke  GetFileAttributesA, szIniDefault
+    lea     eax, [tmp_buf]
+    invoke  GetFullPathNameA, szIniDefault, 500, eax, 0
+    test    eax, eax
+    jz      .check_exe_dir
+    lea     eax, [tmp_buf]
+    invoke  GetFileAttributesA, eax
     cmp     eax, -1
     je      .check_exe_dir
-    cinvoke strcpy, config_path, szIniDefault
+    lea     eax, [tmp_buf]
+    cinvoke strcpy, config_path, eax
     ret
 
 .check_exe_dir:
     invoke  GetModuleFileNameA, 0, exe_dir, 500
     cinvoke strrchr, exe_dir, '\'
     test    eax, eax
-    jz      .use_default
+    jz      .use_cwd_full
     mov     byte [eax], 0
     cinvoke sprintf, config_path, szFmtIniAdj, exe_dir, szIniDefault
     ret
 
-.use_default:
-    cinvoke strcpy, config_path, szIniDefault
+.use_cwd_full:
+    lea     eax, [tmp_buf]
+    cinvoke strcpy, config_path, eax
     ret
 endp
 
@@ -1509,6 +1518,7 @@ section '.idata' import data readable writeable
            GetPrivateProfileIntA, 'GetPrivateProfileIntA',\
            GetComputerNameA, 'GetComputerNameA',\
            GetModuleFileNameA, 'GetModuleFileNameA',\
+           GetFullPathNameA, 'GetFullPathNameA',\
            GetFileAttributesA, 'GetFileAttributesA',\
            GetConsoleWindow, 'GetConsoleWindow',\
            InitializeCriticalSection, 'InitializeCriticalSection',\
