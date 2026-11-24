@@ -1,23 +1,25 @@
-"""RdpNet Web Management Dashboard and REST API Server with Session Authentication."""
+"""RdpNet Web Management Dashboard and REST API Server."""
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import mimetypes
 import os
 import secrets
-import time
 import urllib.parse
+import zipfile
 from typing import Any, Dict, Optional, Tuple
 
-from server.models import NetworkRegistry
+from server.models import Network, NetworkRegistry
 from server.relay import RelayServer
 
 logger = logging.getLogger(__name__)
 
 
 class WebServer:
-    """Asynchronous HTTP Web Server serving REST API and Static Management UI with Session Authentication."""
+    """Asynchronous HTTP Web Server serving REST API and Static Management UI."""
 
     def __init__(
         self,
@@ -26,18 +28,23 @@ class WebServer:
         registry: NetworkRegistry,
         relay: RelayServer,
         admin_password: Optional[str] = None,
+        admin_user: str = "admin",
         static_dir: Optional[str] = None,
+        client_exe_path: Optional[str] = None,
     ) -> None:
         self.host = host
         self.port = port
         self.registry = registry
         self.relay = relay
+        self.admin_user = admin_user
         self.admin_password = admin_password
         self.static_dir = static_dir or os.path.join(os.path.dirname(__file__), "static")
+        self.client_exe_path = client_exe_path or os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "client", "rdp-agent.exe")
+        )
 
         self._server: Optional[asyncio.Server] = None
         self._active_connections: set = set()
-        self._sessions: Dict[str, float] = {}  # token -> login timestamp
 
     async def start(self) -> None:
         """Starts the HTTP server."""
@@ -48,7 +55,7 @@ class WebServer:
         )
         if self.port == 0 and self._server.sockets:
             self.port = self._server.sockets[0].getsockname()[1]
-        logger.info("WebServer listening on http://%s:%d (auth=%s)", self.host, self.port, bool(self.admin_password))
+        logger.info("WebServer listening on http://%s:%d", self.host, self.port)
 
     async def stop(self) -> None:
         """Stops the HTTP server and terminates active client sockets."""
@@ -66,34 +73,96 @@ class WebServer:
         self._active_connections.clear()
         logger.info("WebServer stopped.")
 
-    def _extract_cookie(self, headers: Dict[str, str], name: str) -> Optional[str]:
-        cookie_header = headers.get("cookie", "")
-        for item in cookie_header.split(";"):
-            item = item.strip()
-            if "=" in item:
-                k, v = item.split("=", 1)
-                if k.strip() == name:
-                    return v.strip()
-        return None
-
-    def _is_authenticated(self, headers: Dict[str, str]) -> bool:
+    def _check_auth(self, headers: Dict[str, str]) -> bool:
+        """Verifies HTTP Basic Auth when admin_password is configured."""
         if not self.admin_password:
-            # If no password is set on server, allow open access
             return True
-
-        token = self._extract_cookie(headers, "rdpnet_session")
-        if not token:
+        auth_header = headers.get("authorization", "")
+        if not auth_header.lower().startswith("basic "):
             return False
-
-        # Session token validity (7 days timeout)
-        login_time = self._sessions.get(token)
-        if login_time is None:
+        token_b64 = auth_header[6:].strip()
+        try:
+            decoded = base64.b64decode(token_b64).decode("utf-8")
+        except Exception:
             return False
-        if time.time() - login_time > 7 * 86400:
-            self._sessions.pop(token, None)
+        if ":" not in decoded:
             return False
+        user, password = decoded.split(":", 1)
+        return secrets.compare_digest(user, self.admin_user) and secrets.compare_digest(
+            password, self.admin_password
+        )
 
-        return True
+    def _resolve_server_host(self, headers: Dict[str, str]) -> str:
+        """Resolves the VPS public host/IP from relay binding or HTTP Host header."""
+        if self.relay.host not in ("0.0.0.0", "127.0.0.1", "::", ""):
+            return self.relay.host
+        host_hdr = headers.get("host", "").strip()
+        if host_hdr:
+            if host_hdr.startswith("["):
+                # IPv6 literal [::1]:8080
+                end = host_hdr.find("]")
+                if end != -1:
+                    return host_hdr[: end + 1]
+            elif ":" in host_hdr:
+                return host_hdr.split(":", 1)[0]
+            else:
+                return host_hdr
+        return "<VPS_IP>"
+
+    @staticmethod
+    def _build_snippet_data(
+        net: Network,
+        server_addr: str,
+        role: str,
+        host_name: str,
+        rdp_port: str,
+        local_port: str,
+    ) -> Dict[str, str]:
+        """Generates CLI commands and INI contents for Host or Viewer configuration."""
+        clean_role = "viewer" if role.lower() == "viewer" else "host"
+        rdp_flag = f" -rdp-port {rdp_port}" if rdp_port and rdp_port.lower() != "auto" else ""
+        host_cmd = (
+            f'rdp-agent.exe -server {server_addr} -net {net.id} '
+            f'-key {net.auth_token} -host -name "{host_name}"{rdp_flag}'
+        )
+        local_flag = f" -local {local_port}" if local_port and local_port != "33890" else ""
+        viewer_cmd = (
+            f'rdp-agent.exe -server {server_addr} -net {net.id} '
+            f'-key {net.auth_token} -viewer -target "{host_name}"{local_flag} -mstsc'
+        )
+
+        if clean_role == "viewer":
+            ini_content = (
+                f"[server]\r\n"
+                f"address={server_addr}\r\n\r\n"
+                f"[network]\r\n"
+                f"id={net.id}\r\n"
+                f"key={net.auth_token}\r\n\r\n"
+                f"[node]\r\n"
+                f"role=viewer\r\n"
+                f"target={host_name}\r\n"
+                f"local_port={local_port or '33890'}\r\n"
+                f"mstsc=1\r\n"
+            )
+        else:
+            ini_content = (
+                f"[server]\r\n"
+                f"address={server_addr}\r\n\r\n"
+                f"[network]\r\n"
+                f"id={net.id}\r\n"
+                f"key={net.auth_token}\r\n\r\n"
+                f"[node]\r\n"
+                f"role=host\r\n"
+                f"name={host_name}\r\n"
+                f"rdp_port={rdp_port or 'auto'}\r\n"
+            )
+
+        return {
+            "server_addr": server_addr,
+            "host_cmd": host_cmd,
+            "viewer_cmd": viewer_cmd,
+            "ini_content": ini_content,
+        }
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._active_connections.add(writer)
@@ -125,6 +194,7 @@ class WebServer:
                     k, v = line.split(":", 1)
                     headers[k.strip().lower()] = v.strip()
 
+            # Read remaining body if Content-Length specified
             content_length = int(headers.get("content-length", 0))
             body = body_prefix
             if len(body) < content_length:
@@ -136,6 +206,7 @@ class WebServer:
                     body += chunk
                     remaining -= len(chunk)
 
+            # Route request
             parsed_url = urllib.parse.urlparse(raw_path)
             path = parsed_url.path
             query_params = urllib.parse.parse_qs(parsed_url.query)
@@ -144,6 +215,7 @@ class WebServer:
                 method, path, query_params, headers, body, writer.get_extra_info("peername")
             )
 
+            # Send HTTP response
             status_text = {
                 200: "OK",
                 201: "Created",
@@ -151,8 +223,8 @@ class WebServer:
                 401: "Unauthorized",
                 404: "Not Found",
                 405: "Method Not Allowed",
+                500: "Internal Server Error",
             }.get(status_code, "OK")
-
             response_header = [
                 f"HTTP/1.1 {status_code} {status_text}",
                 f"Content-Length: {len(resp_body)}",
@@ -184,10 +256,40 @@ class WebServer:
         body: bytes,
         peername: Any,
     ) -> Tuple[int, Dict[str, str], bytes]:
+        if not self._check_auth(headers):
+            return (
+                401,
+                {
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "WWW-Authenticate": 'Basic realm="RdpNet Dashboard"',
+                },
+                b"Unauthorized",
+            )
+
+        # Direct EXE download
+        if path == "/download/rdp-agent.exe" and method == "GET":
+            return self._handle_exe_download()
+
+        # REST API Routes
         if path.startswith("/api/"):
             return await self._handle_api(method, path, query, headers, body)
 
+        # Static Assets
         return self._handle_static(path)
+
+    def _handle_exe_download(self) -> Tuple[int, Dict[str, str], bytes]:
+        if not os.path.isfile(self.client_exe_path):
+            return 404, {"Content-Type": "text/plain"}, b"rdp-agent.exe not found on server"
+        with open(self.client_exe_path, "rb") as f:
+            data = f.read()
+        return (
+            200,
+            {
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": 'attachment; filename="rdp-agent.exe"',
+            },
+            data,
+        )
 
     async def _handle_api(
         self,
@@ -198,48 +300,6 @@ class WebServer:
         body: bytes,
     ) -> Tuple[int, Dict[str, str], bytes]:
         json_headers = {"Content-Type": "application/json; charset=utf-8"}
-
-        # Public auth endpoints:
-        # GET /api/auth-status
-        if path == "/api/auth-status" and method == "GET":
-            is_auth = self._is_authenticated(headers)
-            return 200, json_headers, json.dumps({
-                "authenticated": is_auth,
-                "auth_required": bool(self.admin_password),
-            }).encode("utf-8")
-
-        # POST /api/login
-        if path == "/api/login" and method == "POST":
-            try:
-                data = json.loads(body.decode("utf-8") if body else "{}")
-            except Exception:
-                return 400, json_headers, json.dumps({"error": "Invalid JSON"}).encode("utf-8")
-
-            password = data.get("password", "")
-            if not self.admin_password:
-                return 200, json_headers, json.dumps({"status": "ok", "message": "No password configured"}).encode("utf-8")
-
-            if secrets.compare_digest(password, self.admin_password):
-                token = secrets.token_hex(24)
-                self._sessions[token] = time.time()
-                resp_headers = dict(json_headers)
-                resp_headers["Set-Cookie"] = f"rdpnet_session={token}; Path=/; HttpOnly; SameSite=Lax"
-                return 200, resp_headers, json.dumps({"status": "ok"}).encode("utf-8")
-
-            return 401, json_headers, json.dumps({"error": "Invalid password"}).encode("utf-8")
-
-        # POST /api/logout
-        if path == "/api/logout" and method == "POST":
-            token = self._extract_cookie(headers, "rdpnet_session")
-            if token:
-                self._sessions.pop(token, None)
-            resp_headers = dict(json_headers)
-            resp_headers["Set-Cookie"] = "rdpnet_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
-            return 200, resp_headers, json.dumps({"status": "ok"}).encode("utf-8")
-
-        # All other API routes require authentication:
-        if not self._is_authenticated(headers):
-            return 401, json_headers, json.dumps({"error": "Authentication required"}).encode("utf-8")
 
         # GET /api/networks
         if path == "/api/networks" and method == "GET":
@@ -309,38 +369,93 @@ class WebServer:
                 })
             return 200, json_headers, json.dumps(result).encode("utf-8")
 
-        # GET /api/connect-snippet?net=<id>&host=<name>
+        # GET /api/connect-snippet?net=<id>&host=<name>&role=<host|viewer>&rdp_port=<auto|port>&local_port=<33890>
         if path == "/api/connect-snippet" and method == "GET":
             net_id = query.get("net", [""])[0]
             host_name = query.get("host", [""])[0] or "Work-PC"
+            role = query.get("role", ["host"])[0]
+            rdp_port = query.get("rdp_port", ["auto"])[0]
+            local_port = query.get("local_port", ["33890"])[0]
 
             net = self.registry.get_network(net_id)
             if not net:
                 return 404, json_headers, json.dumps({"error": "Network not found"}).encode("utf-8")
 
-            server_host = self.relay.host if self.relay.host not in ("0.0.0.0", "127.0.0.1") else "<VPS_IP>"
+            server_host = self._resolve_server_host(headers)
             server_addr = f"{server_host}:{self.relay.port}"
+            data = self._build_snippet_data(net, server_addr, role, host_name, rdp_port, local_port)
+            return 200, json_headers, json.dumps(data).encode("utf-8")
 
-            host_cmd = f'rdp-agent.exe -server {server_addr} -net {net.id} -key {net.auth_token} -host -name "{host_name}"'
-            viewer_cmd = f'rdp-agent.exe -server {server_addr} -net {net.id} -key {net.auth_token} -viewer -target "{host_name}"'
+        # GET /api/download-bundle?net=<id>&role=<host|viewer>&host=<name>&rdp_port=<auto|port>&local_port=<33890>
+        if path == "/api/download-bundle" and method == "GET":
+            net_id = query.get("net", [""])[0]
+            host_name = query.get("host", [""])[0] or "Work-PC"
+            role = "viewer" if query.get("role", ["host"])[0].lower() == "viewer" else "host"
+            rdp_port = query.get("rdp_port", ["auto"])[0]
+            local_port = query.get("local_port", ["33890"])[0]
 
-            ini_content = (
-                f"[server]\n"
-                f"address={server_addr}\n\n"
-                f"[network]\n"
-                f"id={net.id}\n"
-                f"key={net.auth_token}\n\n"
-                f"[node]\n"
-                f"role=host\n"
-                f"name={host_name}\n"
-                f"rdp_port=3389\n"
+            net = self.registry.get_network(net_id)
+            if not net:
+                return 404, json_headers, json.dumps({"error": "Network not found"}).encode("utf-8")
+
+            server_host = self._resolve_server_host(headers)
+            server_addr = f"{server_host}:{self.relay.port}"
+            snippet = self._build_snippet_data(net, server_addr, role, host_name, rdp_port, local_port)
+
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                if os.path.isfile(self.client_exe_path):
+                    zf.write(self.client_exe_path, arcname="rdp-agent.exe")
+
+                zf.writestr("rdp-agent.ini", snippet["ini_content"].encode("utf-8"))
+
+                if role == "viewer":
+                    start_bat = (
+                        "@echo off\r\n"
+                        "cd /d \"%~dp0\"\r\n"
+                        "echo Starting RdpNet Viewer and launching mstsc...\r\n"
+                        "rdp-agent.exe\r\n"
+                    )
+                    zf.writestr("start_rdp.bat", start_bat.encode("ascii", errors="ignore"))
+                else:
+                    start_bat = (
+                        "@echo off\r\n"
+                        "cd /d \"%~dp0\"\r\n"
+                        "rdp-agent.exe\r\n"
+                    )
+                    install_bat = (
+                        "@echo off\r\n"
+                        "set \"APP_DIR=%LOCALAPPDATA%\\RdpNet\"\r\n"
+                        "if not exist \"%APP_DIR%\" mkdir \"%APP_DIR%\"\r\n"
+                        "copy /Y \"%~dp0rdp-agent.exe\" \"%APP_DIR%\\rdp-agent.exe\" >nul\r\n"
+                        "copy /Y \"%~dp0rdp-agent.ini\" \"%APP_DIR%\\rdp-agent.ini\" >nul\r\n"
+                        "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" "
+                        "/v \"RdpNetAgent\" /t REG_SZ /d \"\\\"%APP_DIR%\\rdp-agent.exe\\\" -silent\" /f >nul\r\n"
+                        "start \"\" \"%APP_DIR%\\rdp-agent.exe\" -silent\r\n"
+                        "echo RdpNet Host installed and running in background!\r\n"
+                        "pause\r\n"
+                    )
+                    uninstall_bat = (
+                        "@echo off\r\n"
+                        "taskkill /IM rdp-agent.exe /F >nul 2>&1\r\n"
+                        "reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" /v \"RdpNetAgent\" /f >nul 2>&1\r\n"
+                        "echo RdpNet Host removed from autostart.\r\n"
+                        "pause\r\n"
+                    )
+                    zf.writestr("start_host.bat", start_bat.encode("ascii", errors="ignore"))
+                    zf.writestr("install_autostart.bat", install_bat.encode("ascii", errors="ignore"))
+                    zf.writestr("uninstall_autostart.bat", uninstall_bat.encode("ascii", errors="ignore"))
+
+            safe_host = "".join(c if c.isalnum() or c in "-_" else "_" for c in host_name)
+            zip_name = f"rdpnet-{role}-{safe_host}.zip"
+            return (
+                200,
+                {
+                    "Content-Type": "application/zip",
+                    "Content-Disposition": f'attachment; filename="{zip_name}"',
+                },
+                buf.getvalue(),
             )
-
-            return 200, json_headers, json.dumps({
-                "host_cmd": host_cmd,
-                "viewer_cmd": viewer_cmd,
-                "ini_content": ini_content,
-            }).encode("utf-8")
 
         return 404, json_headers, json.dumps({"error": "Endpoint not found"}).encode("utf-8")
 
@@ -351,6 +466,7 @@ class WebServer:
             filename = path.lstrip("/")
 
         file_path = os.path.abspath(os.path.join(self.static_dir, filename))
+        # Directory traversal prevention
         if not file_path.startswith(os.path.abspath(self.static_dir)):
             return 404, {"Content-Type": "text/plain"}, b"Not Found"
 

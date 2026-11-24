@@ -4,9 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
-import secrets
 import signal
-import sys
 
 from server.models import NetworkRegistry
 from server.relay import RelayServer
@@ -17,11 +15,12 @@ logger = logging.getLogger("rdpnet-server")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RdpNet Server Daemon")
-    parser.add_argument("--host", default="0.0.0.0", help="Binding IP address (default: 0.0.0.0)")
-    parser.add_argument("--relay-port", type=int, default=8443, help="Relay control & data port (default: 8443)")
-    parser.add_argument("--web-port", type=int, default=8080, help="Web management dashboard port (default: 8080)")
-    parser.add_argument("--data-file", default="networks.json", help="Path to network storage JSON file")
-    parser.add_argument("--admin-pass", default=None, help="Admin password for Web Dashboard (default: from admin.secret or auto-generated)")
+    parser.add_argument("--host", default=os.environ.get("RDPNET_HOST", "0.0.0.0"), help="Binding IP address")
+    parser.add_argument("--relay-port", type=int, default=int(os.environ.get("RDPNET_RELAY_PORT", "8443")), help="Relay port")
+    parser.add_argument("--web-port", type=int, default=int(os.environ.get("RDPNET_WEB_PORT", "8080")), help="Web UI port")
+    parser.add_argument("--data-file", default=os.environ.get("RDPNET_DATA_FILE", "networks.json"), help="JSON storage path")
+    parser.add_argument("--web-user", default=os.environ.get("RDPNET_WEB_USER", "admin"), help="Web UI username")
+    parser.add_argument("--web-pass", default=os.environ.get("RDPNET_WEB_PASS", ""), help="Web UI password (empty = open)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 
@@ -33,33 +32,7 @@ async def main_async() -> None:
         format="%(asctime)s [%(levelname)s] (%(name)s) %(message)s",
     )
 
-    data_dir = os.path.dirname(os.path.abspath(args.data_file))
-    secret_path = os.path.join(data_dir, "admin.secret")
-
-    admin_password = args.admin_pass
-    if not admin_password:
-        if os.path.isfile(secret_path):
-            with open(secret_path, "r", encoding="utf-8") as f:
-                admin_password = f.read().strip()
-        if not admin_password:
-            admin_password = secrets.token_urlsafe(12)
-            try:
-                with open(secret_path, "w", encoding="utf-8") as f:
-                    f.write(admin_password)
-                try:
-                    os.chmod(secret_path, 0o600)
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning("Could not persist admin.secret: %s", e)
-
-    logger.info("==================================================")
-    logger.info("  RdpNet Web Dashboard Admin Password: %s", admin_password)
-    logger.info("  (Stored in: %s)", secret_path)
-    logger.info("==================================================")
-
     registry = NetworkRegistry(args.data_file)
-    # Ensure at least one default network exists on first run
     if not registry.list_networks():
         default_net = registry.create_network("Default Network")
         logger.info("Created initial network '%s' (ID: %s, Key: %s)", default_net.name, default_net.id, default_net.auth_token)
@@ -72,15 +45,18 @@ async def main_async() -> None:
     await relay.start()
     logger.info("RdpNet Relay Server listening on %s:%d", args.host, args.relay_port)
 
+    web_pass = args.web_pass.strip() or None
     web = WebServer(
         host=args.host,
         port=args.web_port,
         registry=registry,
         relay=relay,
-        admin_password=admin_password,
+        admin_user=args.web_user,
+        admin_password=web_pass,
     )
     await web.start()
-    logger.info("RdpNet Web Dashboard listening on http://%s:%d", args.host, args.web_port)
+    auth_mode = f"protected (user={args.web_user})" if web_pass else "open (no password set)"
+    logger.info("RdpNet Web Dashboard listening on http://%s:%d [%s]", args.host, args.web_port, auth_mode)
 
     stop_event = asyncio.Event()
 
@@ -94,7 +70,6 @@ async def main_async() -> None:
             try:
                 loop.add_signal_handler(sig, signal_handler)
             except NotImplementedError:
-                # Windows signal handling fallback
                 pass
 
     try:

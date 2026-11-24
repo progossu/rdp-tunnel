@@ -1,81 +1,13 @@
 let activeTab = 'networks';
 let cachedNetworks = [];
 let cachedNodes = [];
-let authInterval = null;
 
 document.addEventListener('DOMContentLoaded', () => {
-    initAuth();
     initTabs();
     initModals();
-});
-
-async function initAuth() {
-    try {
-        const res = await fetch('/api/auth-status');
-        if (res.ok) {
-            const data = await res.json();
-            if (!data.auth_required || data.authenticated) {
-                showDashboard();
-            } else {
-                showLogin();
-            }
-        } else {
-            showLogin();
-        }
-    } catch (err) {
-        showLogin();
-    }
-
-    document.getElementById('form-login').addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const pass = document.getElementById('login-pass-input').value;
-        const errEl = document.getElementById('login-error');
-        errEl.style.display = 'none';
-
-        try {
-            const res = await fetch('/api/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ password: pass })
-            });
-
-            if (res.ok) {
-                document.getElementById('login-pass-input').value = '';
-                showDashboard();
-            } else {
-                errEl.innerText = 'Incorrect administrator password';
-                errEl.style.display = 'block';
-            }
-        } catch (err) {
-            errEl.innerText = 'Connection error';
-            errEl.style.display = 'block';
-        }
-    });
-
-    document.getElementById('btn-logout').addEventListener('click', async () => {
-        await fetch('/api/logout', { method: 'POST' });
-        showLogin();
-    });
-}
-
-function showLogin() {
-    if (authInterval) {
-        clearInterval(authInterval);
-        authInterval = null;
-    }
-    document.getElementById('login-container').style.display = 'flex';
-    document.getElementById('dashboard-container').style.display = 'none';
-    document.getElementById('login-pass-input').focus();
-}
-
-function showDashboard() {
-    document.getElementById('login-container').style.display = 'none';
-    document.getElementById('dashboard-container').style.display = 'block';
     loadDashboard();
-    if (!authInterval) {
-        authInterval = setInterval(loadDashboard, 4000);
-    }
-}
+    setInterval(loadDashboard, 4000);
+});
 
 function initTabs() {
     document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -112,8 +44,6 @@ function initModals() {
                 document.getElementById('net-name-input').value = '';
                 document.getElementById('net-token-input').value = '';
                 loadDashboard();
-            } else if (res.status === 401) {
-                showLogin();
             } else {
                 alert('Failed to create network');
             }
@@ -133,11 +63,6 @@ async function loadDashboard() {
             fetch('/api/networks'),
             fetch('/api/nodes')
         ]);
-
-        if (netRes.status === 401 || nodeRes.status === 401) {
-            showLogin();
-            return;
-        }
 
         if (netRes.ok && nodeRes.ok) {
             cachedNetworks = await netRes.json();
@@ -214,32 +139,57 @@ function toggleToken(el, token) {
     }
 }
 
-async function showConnectModal(netId, hostName = '') {
+let currentModalNetId = '';
+
+async function refreshConnectModal() {
+    if (!currentModalNetId) return;
+    const role = document.getElementById('cfg-role').value;
+    const hostName = document.getElementById('cfg-host-name').value.trim() || 'Work-PC';
+    const rdpPort = document.getElementById('cfg-rdp-port').value.trim() || 'auto';
+    document.getElementById('cfg-rdp-port-wrap').style.display = role === 'host' ? 'block' : 'none';
+
     try {
-        const url = `/api/connect-snippet?net=${encodeURIComponent(netId)}${hostName ? '&host=' + encodeURIComponent(hostName) : ''}`;
-        const res = await fetch(url);
-        if (!res.ok) {
-            if (res.status === 401) showLogin();
-            return;
-        }
+        const params = new URLSearchParams({
+            net: currentModalNetId,
+            host: hostName,
+            role: role,
+            rdp_port: rdpPort
+        });
+        const res = await fetch(`/api/connect-snippet?${params.toString()}`);
+        if (!res.ok) return;
 
         const data = await res.json();
         document.getElementById('snippet-host-cmd').innerText = data.host_cmd;
         document.getElementById('snippet-viewer-cmd').innerText = data.viewer_cmd;
 
-        const dlBtn = document.getElementById('snippet-dl-ini');
-        dlBtn.onclick = () => {
+        document.getElementById('snippet-dl-zip').onclick = () => {
+            window.location.href = `/api/download-bundle?${params.toString()}`;
+        };
+
+        document.getElementById('snippet-dl-ini').onclick = () => {
             const blob = new Blob([data.ini_content], { type: 'text/plain' });
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
             a.download = 'rdp-agent.ini';
             a.click();
         };
-
-        document.getElementById('modal-connect').classList.add('open');
     } catch (err) {
         console.error(err);
     }
+}
+
+async function showConnectModal(netId, hostName = '', defaultRole = 'host') {
+    currentModalNetId = netId;
+    document.getElementById('cfg-role').value = hostName ? 'viewer' : defaultRole;
+    document.getElementById('cfg-host-name').value = hostName || 'Work-PC';
+    document.getElementById('cfg-rdp-port').value = 'auto';
+
+    document.getElementById('cfg-role').onchange = refreshConnectModal;
+    document.getElementById('cfg-host-name').oninput = refreshConnectModal;
+    document.getElementById('cfg-rdp-port').oninput = refreshConnectModal;
+
+    await refreshConnectModal();
+    document.getElementById('modal-connect').classList.add('open');
 }
 
 function copyCode(id) {
@@ -254,8 +204,6 @@ async function deleteNetwork(id) {
         const res = await fetch(`/api/networks/${encodeURIComponent(id)}`, { method: 'DELETE' });
         if (res.ok) {
             loadDashboard();
-        } else if (res.status === 401) {
-            showLogin();
         }
     } catch (err) {
         console.error(err);

@@ -31,6 +31,7 @@ def test_systemd_service_syntax():
         assert "ExecStart=/usr/bin/python3 -m server.main" in content
         assert "--relay-port 8443" in content
         assert "--web-port 8080" in content
+        assert "EnvironmentFile=-/opt/rdpnet/.env" in content
         assert "Restart=always" in content
 
 
@@ -44,4 +45,5 @@ def test_installer_script_directives():
         assert "systemctl restart rdpnet" in content
         assert "ufw allow 8443/tcp" in content
         assert "ufw allow 8080/tcp" in content
+        assert "RDPNET_WEB_PASS" in content
         assert "/opt/rdpnet" in content

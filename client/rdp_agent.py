@@ -331,6 +331,22 @@ class RdpAgent:
             self._control_buf.extend(chunk)
 
 
+def detect_windows_rdp_port() -> int:
+    """Reads configured RDP listening port from Windows Registry, falling back to 3389."""
+    if sys.platform == "win32":
+        try:
+            import winreg
+
+            key_path = r"SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as reg_key:
+                port_val, _ = winreg.QueryValueEx(reg_key, "PortNumber")
+                if isinstance(port_val, int) and 1 <= port_val <= 65535:
+                    return port_val
+        except Exception:
+            pass
+    return 3389
+
+
 def load_config(config_path: str = "rdp-agent.ini") -> dict:
     """Loads configuration from INI file if present."""
     config = {}
@@ -347,7 +363,10 @@ def load_config(config_path: str = "rdp-agent.ini") -> dict:
             config["name"] = parser.get("node", "name", fallback=None)
             config["target"] = parser.get("node", "target", fallback=None)
             config["local_port"] = parser.getint("node", "local_port", fallback=None)
-            config["rdp_port"] = parser.getint("node", "rdp_port", fallback=None)
+            raw_rdp = parser.get("node", "rdp_port", fallback=None)
+            if raw_rdp is not None:
+                config["rdp_port"] = 0 if raw_rdp.strip().lower() == "auto" else int(raw_rdp)
+            config["mstsc"] = parser.getboolean("node", "mstsc", fallback=False)
     return config
 
 
@@ -357,12 +376,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-server", help="VPS Relay address (e.g., 1.2.3.4:8443)")
     parser.add_argument("-net", help="Virtual Network ID")
     parser.add_argument("-key", help="Network authentication secret")
-    parser.add_argument("-host", action="store_true", help="Run in Host mode (exposes local RDP 3389)")
+    parser.add_argument("-host", action="store_true", help="Run in Host mode (exposes local RDP)")
     parser.add_argument("-viewer", action="store_true", help="Run in Viewer mode (listens for mstsc.exe)")
     parser.add_argument("-name", help="Node name (for Host mode, e.g. Work-PC)")
     parser.add_argument("-target", help="Target Host name (for Viewer mode, optional if only 1 host)")
     parser.add_argument("-local", type=int, default=33890, help="Local listening port for Viewer (default: 33890)")
-    parser.add_argument("-rdp-port", type=int, default=3389, help="Local RDP port on Host (default: 3389)")
+    parser.add_argument("-rdp-port", type=int, default=None, help="Local RDP port on Host (default: auto-detect)")
+    parser.add_argument("-mstsc", action="store_true", help="Auto-launch mstsc.exe in Viewer mode")
     parser.add_argument("-config", default="rdp-agent.ini", help="Path to INI config file (default: rdp-agent.ini)")
     parser.add_argument("-silent", action="store_true", help="Run silently without console logging")
     return parser.parse_args()
@@ -379,7 +399,10 @@ async def main_async() -> None:
     name = args.name or ini_cfg.get("name") or socket.gethostname()
     target = args.target or ini_cfg.get("target")
     local_port = args.local if args.local != 33890 else (ini_cfg.get("local_port") or 33890)
-    rdp_port = args.rdp_port if args.rdp_port != 3389 else (ini_cfg.get("rdp_port") or 3389)
+    rdp_port = args.rdp_port if args.rdp_port is not None else ini_cfg.get("rdp_port", 0)
+    if rdp_port == 0:
+        rdp_port = detect_windows_rdp_port()
+    launch_mstsc = args.mstsc or ini_cfg.get("mstsc", False)
 
     if not net_id or not key:
         print("Error: Both -net <network_id> and -key <secret> are required.")
@@ -394,6 +417,10 @@ async def main_async() -> None:
 
     if not args.silent:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    if role == "viewer" and launch_mstsc and sys.platform == "win32":
+        import subprocess
+        subprocess.Popen(["mstsc.exe", f"/v:127.0.0.1:{local_port}"])
 
     agent = RdpAgent(
         server_host=s_host,

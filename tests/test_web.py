@@ -49,68 +49,6 @@ async def async_http(port: int, method: str, path: str, body: bytes = None, head
 
 
 @pytest.mark.asyncio
-async def test_web_admin_authentication(tmp_path):
-    storage = str(tmp_path / "test_auth_networks.json")
-    registry = NetworkRegistry(storage)
-    relay = RelayServer("127.0.0.1", 0, registry)
-    await relay.start()
-
-    # Protected Web Server with password "SuperSecretPass123"
-    web = WebServer("127.0.0.1", 0, registry, relay, admin_password="SuperSecretPass123")
-    await web.start()
-
-    try:
-        # 1. Check auth-status endpoint
-        status, _, body = await async_http(web.port, "GET", "/api/auth-status")
-        assert status == 200
-        auth_data = json.loads(body.decode())
-        assert auth_data["authenticated"] is False
-        assert auth_data["auth_required"] is True
-
-        # 2. Unauthenticated request to /api/networks must return 401
-        status, _, body = await async_http(web.port, "GET", "/api/networks")
-        assert status == 401
-
-        # 3. Bad password login returns 401
-        bad_login = json.dumps({"password": "WrongPassword"}).encode()
-        status, _, body = await async_http(
-            web.port, "POST", "/api/login", body=bad_login, headers={"Content-Type": "application/json"}
-        )
-        assert status == 401
-
-        # 4. Correct password login returns 200 and Set-Cookie
-        good_login = json.dumps({"password": "SuperSecretPass123"}).encode()
-        status, headers, body = await async_http(
-            web.port, "POST", "/api/login", body=good_login, headers={"Content-Type": "application/json"}
-        )
-        assert status == 200
-        cookie_header = headers.get("set-cookie", "")
-        assert "rdpnet_session=" in cookie_header
-        token = cookie_header.split("rdpnet_session=")[1].split(";")[0]
-
-        # 5. Authenticated request with cookie succeeds
-        status, _, body = await async_http(
-            web.port, "GET", "/api/networks", headers={"Cookie": f"rdpnet_session={token}"}
-        )
-        assert status == 200
-
-        # 6. Logout invalidates session
-        status, _, _ = await async_http(
-            web.port, "POST", "/api/logout", headers={"Cookie": f"rdpnet_session={token}"}
-        )
-        assert status == 200
-
-        # 7. Next request with old token returns 401
-        status, _, _ = await async_http(
-            web.port, "GET", "/api/networks", headers={"Cookie": f"rdpnet_session={token}"}
-        )
-        assert status == 401
-    finally:
-        await web.stop()
-        await relay.stop()
-
-
-@pytest.mark.asyncio
 async def test_web_api_networks_crud(tmp_path):
     storage = str(tmp_path / "test_networks.json")
     registry = NetworkRegistry(storage)
@@ -226,3 +164,90 @@ async def test_web_static_file_serving(tmp_path):
     finally:
         await web.stop()
         await relay.stop()
+
+
+@pytest.mark.asyncio
+async def test_web_basic_auth_and_host_autodetect_and_zip_bundle(tmp_path):
+    import base64
+    import io
+    import zipfile
+
+    storage = str(tmp_path / "test_auth_bundle.json")
+    registry = NetworkRegistry(storage)
+    net = registry.create_network("AuthNet", "secret_key_777")
+
+    relay = RelayServer("0.0.0.0", 0, registry)
+    await relay.start()
+
+    web = WebServer("127.0.0.1", 0, registry, relay, admin_password="super_secret_password")
+    await web.start()
+
+    try:
+        # 1. Unauthenticated request returns 401
+        status, headers, _ = await async_http(web.port, "GET", "/api/networks")
+        assert status == 401
+        assert "Basic" in headers.get("www-authenticate", "")
+
+        # 2. Wrong password returns 401
+        bad_creds = base64.b64encode(b"admin:wrong").decode()
+        status, _, _ = await async_http(web.port, "GET", "/api/networks", headers={"Authorization": f"Basic {bad_creds}"})
+        assert status == 401
+
+        # 3. Valid Basic Auth + custom Host header auto-detects VPS IP
+        good_creds = base64.b64encode(b"admin:super_secret_password").decode()
+        auth_hdrs = {
+            "Authorization": f"Basic {good_creds}",
+            "Host": "45.67.89.10:8080",
+        }
+        status, _, body = await async_http(
+            web.port,
+            "GET",
+            f"/api/connect-snippet?net={net.id}&host=PC-5555&role=host&rdp_port=5555",
+            headers=auth_hdrs,
+        )
+        assert status == 200
+        snippet = json.loads(body.decode())
+        assert f"45.67.89.10:{relay.port}" in snippet["host_cmd"]
+        assert "-rdp-port 5555" in snippet["host_cmd"]
+        assert "rdp_port=5555" in snippet["ini_content"]
+
+        # 4. Download Host ZIP bundle
+        status, headers, zip_bytes = await async_http(
+            web.port,
+            "GET",
+            f"/api/download-bundle?net={net.id}&role=host&host=PC-5555&rdp_port=auto",
+            headers=auth_hdrs,
+        )
+        assert status == 200
+        assert "application/zip" in headers.get("content-type", "")
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            names = zf.namelist()
+            assert "rdp-agent.exe" in names
+            assert "rdp-agent.ini" in names
+            assert "start_host.bat" in names
+            assert "install_autostart.bat" in names
+            ini_text = zf.read("rdp-agent.ini").decode("utf-8")
+            assert f"address=45.67.89.10:{relay.port}" in ini_text
+            assert "rdp_port=auto" in ini_text
+
+        # 5. Download Viewer ZIP bundle
+        status, _, zip_bytes = await async_http(
+            web.port,
+            "GET",
+            f"/api/download-bundle?net={net.id}&role=viewer&host=PC-5555",
+            headers=auth_hdrs,
+        )
+        assert status == 200
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            names = zf.namelist()
+            assert "rdp-agent.exe" in names
+            assert "rdp-agent.ini" in names
+            assert "start_rdp.bat" in names
+            ini_text = zf.read("rdp-agent.ini").decode("utf-8")
+            assert "role=viewer" in ini_text
+            assert "target=PC-5555" in ini_text
+            assert "mstsc=1" in ini_text
+    finally:
+        await web.stop()
+        await relay.stop()
+
