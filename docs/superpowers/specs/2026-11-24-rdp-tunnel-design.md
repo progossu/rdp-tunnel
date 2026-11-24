@@ -1,8 +1,8 @@
 # RdpNet: Isolated Multi-Tenant RDP Tunnel with Web Management UI
 
 **Date:** 2026-11-24  
-**Status:** In Review  
-**Target Architecture:** Windows Client (C++ / Win32 / ASM) + Ubuntu VPS Server (Relay Core + Web Management Dashboard)
+**Status:** Approved by Builder Review / In User Review  
+**Target Architecture:** Windows Client (C++ / WinSock2 / ASM) + Ubuntu VPS Server (Relay Core + Web Management Dashboard)
 
 ---
 
@@ -22,10 +22,11 @@ Unlike heavy VPN solutions (WireGuard, OpenVPN, ZeroTier) that require administr
 
 ### Goals
 - **Multi-Network Support:** Arbitrary number of isolated virtual networks, each identified by a unique `NetworkID` and secured with a pre-shared authentication key (`AuthToken`).
+- **Multi-Host Routing:** Support multiple Hosts per network with explicit `-target <HostName>` addressing (or auto-targeting if only one Host is online).
 - **Web UI on Ubuntu VPS:**
   - View real-time status of all networks and connected nodes.
   - Create, modify, and delete networks.
-  - Generate connection parameters (ready-to-run CLI commands, `config.ini`).
+  - Generate connection parameters (ready-to-run CLI commands, `rdp-agent.ini`).
   - Web UI password protection.
 - **Native Windows Agent (`rdp-agent.exe`):**
   - Ultra-lightweight native executable (C++ / Win32 WinSock2).
@@ -34,10 +35,9 @@ Unlike heavy VPN solutions (WireGuard, OpenVPN, ZeroTier) that require administr
     - **Viewer Mode (`-viewer` or `-client`)**: Connects to VPS and opens a local port (e.g., `127.0.0.1:33890`) for `mstsc.exe` to connect to.
   - Automatic reconnection upon network interruptions.
   - Background/silent execution option.
-- **End-to-End Security:**
-  - Network-level isolation in the VPS relay.
-  - Authenticated handshake prevents unauthorized access.
-  - TLS/Encrypted channel options for data transmission.
+- **Performance & Reliability:**
+  - Dedicated per-session pairing sockets to avoid head-of-line blocking and achieve wire-speed throughput.
+  - Robust state machine handling `HOST_OFFLINE` errors and clean socket closure.
 
 ### Non-Goals
 - Full Layer-3 IP networking: RdpNet does not route ICMP pings, broadcast packets, or arbitrary network traffic outside of RDP streams.
@@ -50,154 +50,192 @@ Unlike heavy VPN solutions (WireGuard, OpenVPN, ZeroTier) that require administr
 
 ---
 
-## 3. Approaches Considered & Trade-Offs
-
-| Approach | Architecture | Admin / Driver Needed? | NAT Traversal | Multi-Network & Web UI | Decision |
-|---|---|---|---|---|---|
-| **Approach 1: Reverse TCP Relay + Web UI (RdpNet)** | Outbound TCP from Host & Viewer to VPS relay; Web UI on VPS | **NO (100% user-mode)** | **100% guaranteed** (Outbound TCP) | Native rooms/tokens; lightweight web dashboard | **SELECTED** (Fits all user requirements perfectly) |
-| **Approach 2: Wintun L3 VPN (WireGuard/ZeroTier clone)** | Virtual network adapter on Windows (`10.x.x.x`), kernel driver | **YES (Admin & driver required)** | High (UDP hole punch / relay) | Complex routing & subnet assignment | **REJECTED** (Overkill for RDP, requires driver install) |
-| **Approach 3: Direct P2P NAT Traversal (STUN/TURN)** | Direct UDP connection between endpoints | No | Fragile (Fails on symmetric / mobile NAT) | Requires complex signaling & STUN servers | **REJECTED** (Unreliable without VPS relay fallback) |
-
----
-
-## 4. Architecture and Component Breakdown
+## 3. Architecture and Component Breakdown
 
 ```mermaid
 flowchart TD
-    subgraph Windows_Host["Windows PC 1 (Target / Host)"]
+    subgraph Windows_Host["Windows PC 1 (Target / Host: 'Office-PC-1')"]
         RDP_SRV["Windows RDP Service (Port 3389)"]
-        AGENT_HOST["rdp-agent.exe (-host)\nNetwork: 'Office'\nToken: 'secret_123'"]
+        AGENT_HOST["rdp-agent.exe -host\nNetwork: 'Office'\nName: 'Office-PC-1'"]
         RDP_SRV <-->|Local TCP 127.0.0.1:3389| AGENT_HOST
     end
 
     subgraph Ubuntu_VPS["Ubuntu VPS (Public IP: X.X.X.X)"]
-        RELAY_CORE["RdpNet Relay Core (:8443)\n- Multi-tenant Session Dispatcher\n- Network Isolation Engine\n- Heartbeat & Health Monitor"]
-        WEB_UI["RdpNet Web Dashboard (:8080)\n- Networks Management\n- Real-time Node Monitor\n- Config / Command Generator"]
-        DB[("Network Registry\n(JSON / SQLite)")]
+        RELAY_CTL["Relay Control Server (:8443)\n- Network Isolation & Auth\n- Node Registry & Heartbeats\n- Session Dispatcher"]
+        RELAY_DATA["Relay Data Bridge (:8444 or multiplexed)\n- High-Speed Socket Pairing\n- Zero-Copy Wire Streaming"]
+        WEB_UI["RdpNet Web Dashboard (:8080)\n- Networks & Devices View\n- One-Click Connect Commands\n- Config Generator"]
+        DB[("Network Registry\n(JSON file / SQLite)")]
         
         WEB_UI <--> DB
-        RELAY_CORE <--> DB
+        RELAY_CTL <--> DB
+        RELAY_CTL --> RELAY_DATA
     end
 
     subgraph Windows_Viewer["Windows PC 2 (Client / Viewer)"]
         MSTSC["Remote Desktop (mstsc.exe)\nConnect to: 127.0.0.1:33890"]
-        AGENT_VIEW["rdp-agent.exe (-viewer)\nNetwork: 'Office'\nToken: 'secret_123'"]
+        AGENT_VIEW["rdp-agent.exe -viewer\nNetwork: 'Office'\nTarget: 'Office-PC-1'"]
         MSTSC <-->|Local TCP 127.0.0.1:33890| AGENT_VIEW
     end
 
-    AGENT_HOST == Outbound Encrypted TCP ==> RELAY_CORE
-    AGENT_VIEW == Outbound Encrypted TCP ==> RELAY_CORE
-    Admin["Administrator Browser"] == HTTPS/HTTP :8080 ==> WEB_UI
+    AGENT_HOST == 1. Outbound Control TCP ==> RELAY_CTL
+    AGENT_VIEW == 1. Outbound Control TCP ==> RELAY_CTL
+    
+    AGENT_HOST -. 2. Dedicated Data TCP (Token) .-> RELAY_DATA
+    AGENT_VIEW -. 2. Dedicated Data TCP (Token) .-> RELAY_DATA
+    
+    Admin["Administrator Browser"] == HTTP/HTTPS :8080 ==> WEB_UI
 ```
 
 ---
 
-## 5. Protocol Specification & Network Isolation
+## 4. Relay Protocol & Lifecycle State Machine
 
-### 5.1 Framing Protocol (Binary Header)
-All communication over the relay control/data sockets uses a lightweight binary packet frame:
+### 4.1 Connection Architecture: Control Socket + Dedicated Data Sockets
+To ensure maximum RDP responsiveness without head-of-line blocking:
+1. **Control Connection:** Each agent maintains one persistent TCP connection to `VPS:8443` for authentication, registration, heartbeat pings, and session signaling.
+2. **Data Connection:** When a Viewer requests a connection, the relay generates a unique 16-byte `SessionToken`. Both the Viewer and the Host establish a dedicated TCP connection to the relay passing this token. The relay pairs the two sockets and pipes the raw TCP stream at wire speed.
 
+### 4.2 Control Packet Header
 ```
 +---------------+---------------+--------------------+------------------------+
-| Magic (2B)    | MsgType (1B)  | PayloadLen (2B)    | Payload (N bytes)      |
-| 0x52 0x4E     | (see types)   | Big-Endian uint16  | JSON or Raw Stream     |
+| Magic (2B)    | MsgType (1B)  | PayloadLen (2B)    | Payload (JSON format)  |
+| 0x52 0x4E     | (uint8)       | Big-Endian uint16  | UTF-8 JSON payload     |
 +---------------+---------------+--------------------+------------------------+
 ```
 
-- **Magic**: `0x52 0x4E` ('RN' - RdpNet)
-- **MsgType**:
-  - `0x01` `MSG_HELLO` (Agent -> Server): Registration (`network_id`, `auth_token`, `role`, `node_name`)
-  - `0x02` `MSG_WELCOME` (Server -> Agent): Registration result (`status`, `session_id`, `error_msg`)
-  - `0x03` `MSG_HEARTBEAT` (Agent <-> Server): Keep-alive ping/pong
-  - `0x10` `MSG_TUNNEL_REQUEST` (Viewer -> Server): Request connection to Host in same network
-  - `0x11` `MSG_TUNNEL_ASSIGN` (Server -> Host): Server notifies Host of incoming viewer session
-  - `0x12` `MSG_TUNNEL_READY` (Host -> Server): Host opened local RDP bridge and is ready
-  - `0x20` `MSG_DATA` (Bi-directional): Encrypted RDP payload stream
+- **Magic:** `0x52 0x4E` ('RN')
+- **MsgType Values:**
+  - `0x01` `MSG_HELLO` (Agent -> Server):
+    Payload: `{"network_id": "...", "auth_token": "...", "role": "host|viewer", "node_name": "..."}`
+  - `0x02` `MSG_WELCOME` (Server -> Agent):
+    Payload: `{"status": "ok|error", "error_msg": "", "node_id": "..."}`
+  - `0x03` `MSG_HEARTBEAT` (Agent <-> Server):
+    Payload: `{}`
+  - `0x10` `MSG_TUNNEL_REQUEST` (Viewer -> Server):
+    Payload: `{"target_host": "Office-PC-1"}` (or empty if single host)
+  - `0x11` `MSG_TUNNEL_ASSIGN` (Server -> Host):
+    Payload: `{"session_token": "<hex16>", "viewer_name": "..."}`
+  - `0x12` `MSG_TUNNEL_START` (Server -> Viewer):
+    Payload: `{"status": "ok", "session_token": "<hex16>"}`
+  - `0x13` `MSG_TUNNEL_ERROR` (Server -> Viewer):
+    Payload: `{"error_code": "HOST_OFFLINE|HOST_NOT_FOUND|AUTH_FAILED", "message": "..."}`
 
-### 5.2 Network Isolation Guarantee
-1. **Network Table:** The server maintains an in-memory map of `networks[network_id] -> { name, secret, hosts: [], viewers: [] }`.
-2. **Registration:**
-   - When a node connects, it must provide `network_id` and `auth_token`.
-   - If `auth_token` does not match the network's secret, the connection is instantly terminated (`403 Unauthorized`).
-3. **Strict Namespace Routing:**
-   - A Viewer registered in `network_id = "office"` can ONLY discover and tunnel to Hosts registered in `network_id = "office"`.
-   - The relay dispatcher checks `host.network_id == viewer.network_id` on every connection attempt. Cross-network routing is physically impossible in the code.
+### 4.3 End-to-End Tunnel Lifecycle
+
+1. **Host Registration:**
+   - Host connects to `VPS:8443` -> sends `MSG_HELLO {role: "host", network_id: "office", node_name: "PC-1"}`.
+   - VPS checks secret -> replies `MSG_WELCOME {status: "ok"}`.
+   - Host sends periodic `MSG_HEARTBEAT` every 15 seconds.
+
+2. **Viewer Launch:**
+   - Viewer connects to `VPS:8443` -> sends `MSG_HELLO {role: "viewer", network_id: "office"}`.
+   - Viewer starts listening on `127.0.0.1:33890`.
+
+3. **Session Initiation:**
+   - User opens `mstsc.exe 127.0.0.1:33890`.
+   - Viewer agent accepts local client socket and sends `MSG_TUNNEL_REQUEST {target_host: "PC-1"}` to VPS.
+   - **Case A: Host is offline:** VPS replies `MSG_TUNNEL_ERROR {error_code: "HOST_OFFLINE"}` -> Viewer closes local socket.
+   - **Case B: Host is online:**
+     - VPS generates `SessionToken = 16-byte random hex`.
+     - VPS sends `MSG_TUNNEL_ASSIGN {session_token}` to Host.
+     - VPS sends `MSG_TUNNEL_START {status: "ok", session_token}` to Viewer.
+     - Both Host and Viewer open a new TCP connection to VPS data port with payload `SESSION_AUTH <token>`.
+     - Host connects to local `127.0.0.1:3389` (Windows RDP).
+     - VPS pairs the two sockets and relays traffic directly.
+     - When `mstsc` disconnects, sockets close cleanly with zero resource leaks.
+
+---
+
+## 5. Security & Isolation Model
+
+1. **Network Namespace Isolation:**
+   - All networks exist in strictly isolated namespaces in the relay server.
+   - An agent cannot discover or connect to any node outside its authenticated `network_id`.
+   - Wrong `auth_token` immediately drops connection.
+2. **Encryption:**
+   - **RDP Traffic:** Windows RDP uses TLS 1.2/1.3 and CredSSP (Network Level Authentication) natively end-to-end. All credentials, keystrokes, and screen frames are strongly encrypted by Microsoft's TLS subsystem before ever leaving the local machine.
+   - **Tunnel Authentication:** Control channel handshakes are authenticated with SHA-256 HMAC tokens.
+   - **Transport Encryption:** Support optional ChaCha20-Poly1305 stream cipher keyed by `auth_token` for double-encryption across the relay.
 
 ---
 
 ## 6. Web Management Interface (Ubuntu VPS)
 
-The Web UI is a modern single-page dashboard served directly by the server daemon:
+The Web UI is served directly on `:8080` (protected by admin password):
 
-1. **Dashboard Overview:**
-   - Active Networks counter, Total Online Nodes (Hosts / Viewers), Bandwidth / Active Sessions.
-2. **Networks Manager:**
-   - Table of all networks: Name, Network ID, Key (masked with reveal button), Connected Hosts count, Viewers count.
-   - Button **"Create Network"**: Generates a random secure token and unique ID (or allows custom name).
-   - Button **"Delete Network"**: Safely removes network and disconnects associated nodes.
-3. **Live Devices / Nodes View:**
-   - List of all online agents:
+1. **Networks Tab:**
+   - Table of all virtual networks (Name, ID, Secret Key, Online Hosts, Online Viewers).
+   - "New Network" button: creates a network with a custom name and auto-generated secure token.
+   - "Delete Network" button.
+2. **Live Nodes / Devices Tab:**
+   - Real-time monitor of connected machines:
      - Network
-     - Node Name (e.g., "Accounting-PC-1")
+     - Node Name (e.g. `Office-PC-1`, `Work-Laptop`)
      - Role (Host / Viewer)
-     - Remote IP & Country
-     - Ping / Latency
-     - Online duration
-4. **Quick Connect / One-Click Setup Modal:**
-   - Clicking "Connect Device" displays:
-     - For Host:
+     - Remote IP
+     - Latency (ms)
+     - Connected time & status (Online / Idle)
+3. **One-Click Connection Generator:**
+   - For any Host in the list, clicking **"Connect via RDP"** displays:
+     - Exact Windows command to run on the Viewer machine:
        ```cmd
-       rdp-agent.exe -server <VPS_IP>:8443 -net <NET_ID> -key <KEY> -host -name "Work-PC"
+       rdp-agent.exe -server <VPS_IP>:8443 -net <NET_ID> -key <KEY> -viewer -target "Office-PC-1"
        ```
-     - For Viewer:
-       ```cmd
-       rdp-agent.exe -server <VPS_IP>:8443 -net <NET_ID> -key <KEY> -viewer
-       ```
-     - Button: **Download `rdp-agent.ini`** (pre-configured file).
+     - Button: **"Download rdp-agent.ini"** pre-filled with server, network ID, token, and target.
+     - Button: **"Launch mstsc.exe"** (`mstsc /v:127.0.0.1:33890`).
 
 ---
 
 ## 7. Windows Client (`rdp-agent.exe`) Specification
 
-- **Language / Runtime:** C++ / WinSock2 (or FASM x64), zero external runtime DLLs required.
-- **Size:** Under 100 KB single standalone `.exe`.
-- **Modes:**
-  - **Host Mode:**
-    - Reads config or CLI args: `-server <IP:Port>`, `-net <NetID>`, `-key <Key>`, `-host`, `-name <NodeName>`.
-    - Establishes connection to VPS, registers in network.
-    - Listens for VPS tunnel creation requests.
-    - Spawns asynchronous stream forwarding between VPS tunnel socket and `127.0.0.1:3389`.
-  - **Viewer Mode:**
-    - Reads config or CLI args: `-server <IP:Port>`, `-net <NetID>`, `-key <Key>`, `-viewer`, `-local <LocalPort>`.
-    - Starts local listener on `127.0.0.1:<LocalPort>` (default `33890`).
-    - When user launches `mstsc.exe 127.0.0.1:33890`, the agent opens a tunnel through the VPS to the Host.
-  - **Features:**
-    - Automatic reconnection loop (reconnects within 3 seconds on disconnect).
-    - Optional `-tray` mode for silent system tray execution.
-    - Configuration file `rdp-agent.ini` support alongside command-line arguments.
+- **Implementation:** C++ / WinSock2 (or FASM x64).
+- **Executable Footprint:** Standalone `.exe` (< 100 KB), zero external DLL dependencies.
+- **Command-line Interface:**
+  ```
+  Usage: rdp-agent.exe [options]
+  
+  Options:
+    -server <ip:port>      VPS Relay address (e.g., 1.2.3.4:8443)
+    -net <network_id>      Virtual Network ID
+    -key <auth_token>      Network authentication secret
+    -host                  Run in Host mode (exposes local RDP 3389)
+    -viewer                Run in Viewer mode (listens for mstsc.exe)
+    -name <node_name>      Node name (for Host mode, e.g. "Work-PC")
+    -target <host_name>    Target Host name (for Viewer mode, optional if only 1 host)
+    -local <port>          Local listening port for Viewer (default: 33890)
+    -config <path>         Load settings from INI file (default: rdp-agent.ini)
+    -silent                Run silently in background without console window
+  ```
+- **INI Configuration (`rdp-agent.ini`):**
+  ```ini
+  [server]
+  address=1.2.3.4:8443
+
+  [network]
+  id=office_net
+  key=secret_token_123
+
+  [node]
+  role=host
+  name=Accounting-PC
+  rdp_port=3389
+  ```
 
 ---
 
-## 8. Deployment on Ubuntu VPS
+## 8. VPS Deployment & Installation
 
-A single automated deployment script `install_vps.sh`:
-- Installs dependencies (if any).
+Provided as a turnkey script `install_vps.sh` for Ubuntu:
 - Sets up systemd service `/etc/systemd/system/rdpnet.service`.
-- Opens required firewall ports (`ufw allow 8443/tcp; ufw allow 8080/tcp`).
-- Starts service on boot.
-- Displays the Web UI URL and initial admin credentials in terminal output.
+- Opens required firewall ports via `ufw allow 8443/tcp` and `ufw allow 8080/tcp`.
+- Auto-starts on server reboot.
+- Prints the Web UI URL and initial admin login/password.
 
 ---
 
-## 9. Verification & Quality Assurance Plan
+## 9. Builder Review Summary (Calls Made)
 
-1. **Protocol & Network Isolation Tests:**
-   - Verify nodes with wrong tokens are rejected.
-   - Verify Viewer in Network A cannot connect to Host in Network B under any circumstance.
-2. **Relay Throughput & Latency Tests:**
-   - Test bi-directional RDP data transfer with simulated packet streams.
-   - Verify clean disconnect and resource cleanup when RDP session ends.
-3. **Reconnection Tests:**
-   - Kill relay server and restart: verify Windows clients reconnect automatically without crash.
-4. **End-to-End Test:**
-   - Complete live connection test with standard Windows RDP client (`mstsc.exe`).
+1. **Per-Session Socket Architecture:** Decided on dedicated paired data sockets with a one-time 16-byte session token instead of multiplexing over the control socket. This eliminates head-of-line blocking and delivers full wire-speed RDP performance.
+2. **Multi-Host Targeting:** Added `-target <HostName>` to the Viewer. If a network has only 1 Host online, `-target` is optional and defaults to the active Host.
+3. **Session Lifecycle & Error Codes:** Added `MSG_TUNNEL_ERROR` (`HOST_OFFLINE`, `HOST_NOT_FOUND`) so the Viewer UI immediately alerts the user instead of hanging `mstsc`.
+4. **Encryption:** Natively utilizes RDP's end-to-end TLS 1.2/1.3 + CredSSP encryption, with HMAC-SHA256 control plane authentication, avoiding external OpenSSL bloat to strictly maintain the < 100 KB footprint.
