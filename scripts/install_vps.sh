@@ -70,17 +70,22 @@ PUBLIC_IP=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
 sleep 1
 
 if systemctl is-active --quiet rdpnet; then
+    ADMIN_PASS=$(cat "${INSTALL_DIR}/admin.secret" 2>/dev/null || echo "See logs: journalctl -u rdpnet")
+
     echo -e "${GREEN}====================================================${NC}"
     echo -e "${GREEN}  ✓ RdpNet successfully installed and running!      ${NC}"
     echo -e "${GREEN}====================================================${NC}"
     echo ""
     echo -e "Web Management Dashboard:  ${BLUE}http://${PUBLIC_IP}:8080${NC}"
+    echo -e "Web Admin Password:        ${GREEN}${ADMIN_PASS}${NC}"
     echo -e "Relay Core Port:           ${BLUE}${PUBLIC_IP}:8443${NC}"
     echo ""
     echo -e "${YELLOW}Quick Start:${NC}"
-    echo "1. Open http://${PUBLIC_IP}:8080 in your browser to manage networks."
-    echo "2. Copy the one-click connect command or download rdp-agent.ini."
+    echo "1. Open http://${PUBLIC_IP}:8080 in your browser and enter the Admin Password above."
+    echo "2. Create or select your isolated network and copy the one-click connect command."
     echo "3. Run rdp-agent.exe on your Windows machines!"
+    echo ""
+    echo "Password file location:    ${INSTALL_DIR}/admin.secret"
     echo ""
     echo "Service management commands:"
     echo "  systemctl status rdpnet"

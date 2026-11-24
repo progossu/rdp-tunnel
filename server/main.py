@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relay-port", type=int, default=8443, help="Relay control & data port (default: 8443)")
     parser.add_argument("--web-port", type=int, default=8080, help="Web management dashboard port (default: 8080)")
     parser.add_argument("--data-file", default="networks.json", help="Path to network storage JSON file")
+    parser.add_argument("--admin-pass", default=None, help="Admin password for Web Dashboard (default: from admin.secret or auto-generated)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 
@@ -30,6 +31,31 @@ async def main_async() -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s [%(levelname)s] (%(name)s) %(message)s",
     )
+
+    data_dir = os.path.dirname(os.path.abspath(args.data_file))
+    secret_path = os.path.join(data_dir, "admin.secret")
+
+    admin_password = args.admin_pass
+    if not admin_password:
+        if os.path.isfile(secret_path):
+            with open(secret_path, "r", encoding="utf-8") as f:
+                admin_password = f.read().strip()
+        if not admin_password:
+            admin_password = secrets.token_urlsafe(12)
+            try:
+                with open(secret_path, "w", encoding="utf-8") as f:
+                    f.write(admin_password)
+                try:
+                    os.chmod(secret_path, 0o600)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning("Could not persist admin.secret: %s", e)
+
+    logger.info("==================================================")
+    logger.info("  RdpNet Web Dashboard Admin Password: %s", admin_password)
+    logger.info("  (Stored in: %s)", secret_path)
+    logger.info("==================================================")
 
     registry = NetworkRegistry(args.data_file)
     # Ensure at least one default network exists on first run
@@ -50,6 +76,7 @@ async def main_async() -> None:
         port=args.web_port,
         registry=registry,
         relay=relay,
+        admin_password=admin_password,
     )
     await web.start()
     logger.info("RdpNet Web Dashboard listening on http://%s:%d", args.host, args.web_port)

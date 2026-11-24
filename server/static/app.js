@@ -1,13 +1,81 @@
 let activeTab = 'networks';
 let cachedNetworks = [];
 let cachedNodes = [];
+let authInterval = null;
 
 document.addEventListener('DOMContentLoaded', () => {
+    initAuth();
     initTabs();
     initModals();
-    loadDashboard();
-    setInterval(loadDashboard, 4000);
 });
+
+async function initAuth() {
+    try {
+        const res = await fetch('/api/auth-status');
+        if (res.ok) {
+            const data = await res.json();
+            if (!data.auth_required || data.authenticated) {
+                showDashboard();
+            } else {
+                showLogin();
+            }
+        } else {
+            showLogin();
+        }
+    } catch (err) {
+        showLogin();
+    }
+
+    document.getElementById('form-login').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const pass = document.getElementById('login-pass-input').value;
+        const errEl = document.getElementById('login-error');
+        errEl.style.display = 'none';
+
+        try {
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: pass })
+            });
+
+            if (res.ok) {
+                document.getElementById('login-pass-input').value = '';
+                showDashboard();
+            } else {
+                errEl.innerText = 'Incorrect administrator password';
+                errEl.style.display = 'block';
+            }
+        } catch (err) {
+            errEl.innerText = 'Connection error';
+            errEl.style.display = 'block';
+        }
+    });
+
+    document.getElementById('btn-logout').addEventListener('click', async () => {
+        await fetch('/api/logout', { method: 'POST' });
+        showLogin();
+    });
+}
+
+function showLogin() {
+    if (authInterval) {
+        clearInterval(authInterval);
+        authInterval = null;
+    }
+    document.getElementById('login-container').style.display = 'flex';
+    document.getElementById('dashboard-container').style.display = 'none';
+    document.getElementById('login-pass-input').focus();
+}
+
+function showDashboard() {
+    document.getElementById('login-container').style.display = 'none';
+    document.getElementById('dashboard-container').style.display = 'block';
+    loadDashboard();
+    if (!authInterval) {
+        authInterval = setInterval(loadDashboard, 4000);
+    }
+}
 
 function initTabs() {
     document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -44,6 +112,8 @@ function initModals() {
                 document.getElementById('net-name-input').value = '';
                 document.getElementById('net-token-input').value = '';
                 loadDashboard();
+            } else if (res.status === 401) {
+                showLogin();
             } else {
                 alert('Failed to create network');
             }
@@ -63,6 +133,11 @@ async function loadDashboard() {
             fetch('/api/networks'),
             fetch('/api/nodes')
         ]);
+
+        if (netRes.status === 401 || nodeRes.status === 401) {
+            showLogin();
+            return;
+        }
 
         if (netRes.ok && nodeRes.ok) {
             cachedNetworks = await netRes.json();
@@ -143,7 +218,10 @@ async function showConnectModal(netId, hostName = '') {
     try {
         const url = `/api/connect-snippet?net=${encodeURIComponent(netId)}${hostName ? '&host=' + encodeURIComponent(hostName) : ''}`;
         const res = await fetch(url);
-        if (!res.ok) return;
+        if (!res.ok) {
+            if (res.status === 401) showLogin();
+            return;
+        }
 
         const data = await res.json();
         document.getElementById('snippet-host-cmd').innerText = data.host_cmd;
@@ -176,6 +254,8 @@ async function deleteNetwork(id) {
         const res = await fetch(`/api/networks/${encodeURIComponent(id)}`, { method: 'DELETE' });
         if (res.ok) {
             loadDashboard();
+        } else if (res.status === 401) {
+            showLogin();
         }
     } catch (err) {
         console.error(err);

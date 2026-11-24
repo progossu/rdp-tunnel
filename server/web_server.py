@@ -1,4 +1,4 @@
-"""RdpNet Web Management Dashboard and REST API Server."""
+"""RdpNet Web Management Dashboard and REST API Server with Session Authentication."""
 
 import asyncio
 import json
@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import os
 import secrets
+import time
 import urllib.parse
 from typing import Any, Dict, Optional, Tuple
 
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class WebServer:
-    """Asynchronous HTTP Web Server serving REST API and Static Management UI."""
+    """Asynchronous HTTP Web Server serving REST API and Static Management UI with Session Authentication."""
 
     def __init__(
         self,
@@ -36,6 +37,7 @@ class WebServer:
 
         self._server: Optional[asyncio.Server] = None
         self._active_connections: set = set()
+        self._sessions: Dict[str, float] = {}  # token -> login timestamp
 
     async def start(self) -> None:
         """Starts the HTTP server."""
@@ -46,7 +48,7 @@ class WebServer:
         )
         if self.port == 0 and self._server.sockets:
             self.port = self._server.sockets[0].getsockname()[1]
-        logger.info("WebServer listening on http://%s:%d", self.host, self.port)
+        logger.info("WebServer listening on http://%s:%d (auth=%s)", self.host, self.port, bool(self.admin_password))
 
     async def stop(self) -> None:
         """Stops the HTTP server and terminates active client sockets."""
@@ -63,6 +65,35 @@ class WebServer:
                 pass
         self._active_connections.clear()
         logger.info("WebServer stopped.")
+
+    def _extract_cookie(self, headers: Dict[str, str], name: str) -> Optional[str]:
+        cookie_header = headers.get("cookie", "")
+        for item in cookie_header.split(";"):
+            item = item.strip()
+            if "=" in item:
+                k, v = item.split("=", 1)
+                if k.strip() == name:
+                    return v.strip()
+        return None
+
+    def _is_authenticated(self, headers: Dict[str, str]) -> bool:
+        if not self.admin_password:
+            # If no password is set on server, allow open access
+            return True
+
+        token = self._extract_cookie(headers, "rdpnet_session")
+        if not token:
+            return False
+
+        # Session token validity (7 days timeout)
+        login_time = self._sessions.get(token)
+        if login_time is None:
+            return False
+        if time.time() - login_time > 7 * 86400:
+            self._sessions.pop(token, None)
+            return False
+
+        return True
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._active_connections.add(writer)
@@ -94,7 +125,6 @@ class WebServer:
                     k, v = line.split(":", 1)
                     headers[k.strip().lower()] = v.strip()
 
-            # Read remaining body if Content-Length specified
             content_length = int(headers.get("content-length", 0))
             body = body_prefix
             if len(body) < content_length:
@@ -106,7 +136,6 @@ class WebServer:
                     body += chunk
                     remaining -= len(chunk)
 
-            # Route request
             parsed_url = urllib.parse.urlparse(raw_path)
             path = parsed_url.path
             query_params = urllib.parse.parse_qs(parsed_url.query)
@@ -115,10 +144,15 @@ class WebServer:
                 method, path, query_params, headers, body, writer.get_extra_info("peername")
             )
 
-            # Send HTTP response
-            status_text = {200: "OK", 201: "Created", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed"}.get(
-                status_code, "OK"
-            )
+            status_text = {
+                200: "OK",
+                201: "Created",
+                400: "Bad Request",
+                401: "Unauthorized",
+                404: "Not Found",
+                405: "Method Not Allowed",
+            }.get(status_code, "OK")
+
             response_header = [
                 f"HTTP/1.1 {status_code} {status_text}",
                 f"Content-Length: {len(resp_body)}",
@@ -150,11 +184,9 @@ class WebServer:
         body: bytes,
         peername: Any,
     ) -> Tuple[int, Dict[str, str], bytes]:
-        # REST API Routes
         if path.startswith("/api/"):
             return await self._handle_api(method, path, query, headers, body)
 
-        # Static Assets
         return self._handle_static(path)
 
     async def _handle_api(
@@ -166,6 +198,48 @@ class WebServer:
         body: bytes,
     ) -> Tuple[int, Dict[str, str], bytes]:
         json_headers = {"Content-Type": "application/json; charset=utf-8"}
+
+        # Public auth endpoints:
+        # GET /api/auth-status
+        if path == "/api/auth-status" and method == "GET":
+            is_auth = self._is_authenticated(headers)
+            return 200, json_headers, json.dumps({
+                "authenticated": is_auth,
+                "auth_required": bool(self.admin_password),
+            }).encode("utf-8")
+
+        # POST /api/login
+        if path == "/api/login" and method == "POST":
+            try:
+                data = json.loads(body.decode("utf-8") if body else "{}")
+            except Exception:
+                return 400, json_headers, json.dumps({"error": "Invalid JSON"}).encode("utf-8")
+
+            password = data.get("password", "")
+            if not self.admin_password:
+                return 200, json_headers, json.dumps({"status": "ok", "message": "No password configured"}).encode("utf-8")
+
+            if secrets.compare_digest(password, self.admin_password):
+                token = secrets.token_hex(24)
+                self._sessions[token] = time.time()
+                resp_headers = dict(json_headers)
+                resp_headers["Set-Cookie"] = f"rdpnet_session={token}; Path=/; HttpOnly; SameSite=Lax"
+                return 200, resp_headers, json.dumps({"status": "ok"}).encode("utf-8")
+
+            return 401, json_headers, json.dumps({"error": "Invalid password"}).encode("utf-8")
+
+        # POST /api/logout
+        if path == "/api/logout" and method == "POST":
+            token = self._extract_cookie(headers, "rdpnet_session")
+            if token:
+                self._sessions.pop(token, None)
+            resp_headers = dict(json_headers)
+            resp_headers["Set-Cookie"] = "rdpnet_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+            return 200, resp_headers, json.dumps({"status": "ok"}).encode("utf-8")
+
+        # All other API routes require authentication:
+        if not self._is_authenticated(headers):
+            return 401, json_headers, json.dumps({"error": "Authentication required"}).encode("utf-8")
 
         # GET /api/networks
         if path == "/api/networks" and method == "GET":
@@ -211,7 +285,6 @@ class WebServer:
             net_id = path[len("/api/networks/") :].strip()
             deleted = self.registry.delete_network(net_id)
             if deleted:
-                # Also disconnect active nodes from relay
                 self.relay.active_hosts.pop(net_id, None)
                 self.relay.active_viewers.pop(net_id, None)
                 return 200, json_headers, json.dumps({"status": "ok", "deleted": net_id}).encode("utf-8")
@@ -278,7 +351,6 @@ class WebServer:
             filename = path.lstrip("/")
 
         file_path = os.path.abspath(os.path.join(self.static_dir, filename))
-        # Directory traversal prevention
         if not file_path.startswith(os.path.abspath(self.static_dir)):
             return 404, {"Content-Type": "text/plain"}, b"Not Found"
 
