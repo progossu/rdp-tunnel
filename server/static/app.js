@@ -180,8 +180,9 @@ async function refreshConnectModal() {
 
 async function showConnectModal(netId, hostName = '', defaultRole = 'host') {
     currentModalNetId = netId;
+    const onlineHost = cachedNodes.find(n => n.network_id === netId && n.role === 'host');
     document.getElementById('cfg-role').value = hostName ? 'viewer' : defaultRole;
-    document.getElementById('cfg-host-name').value = hostName || 'Work-PC';
+    document.getElementById('cfg-host-name').value = hostName || (onlineHost ? onlineHost.name : 'auto');
     document.getElementById('cfg-rdp-port').value = 'auto';
 
     document.getElementById('cfg-role').onchange = refreshConnectModal;

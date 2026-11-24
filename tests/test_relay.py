@@ -504,3 +504,54 @@ async def test_dual_port_configuration(registry):
         await v_w.wait_closed()
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_does_not_evict_and_case_insensitive_auto_target(registry):
+    net = registry.create_network("ReconnectNet", "token123")
+    server = RelayServer(host="127.0.0.1", port=0, registry=registry)
+    await server.start()
+
+    try:
+        # 1. Host connects first time
+        h1_r, h1_w = await asyncio.open_connection("127.0.0.1", server.port)
+        await send_msg(h1_w, MSG_HELLO, {"network_id": net.id, "auth_token": "token123", "role": "host", "name": "Office-PC"})
+        await recv_msg(h1_r)
+
+        # 2. Same Host reconnects before h1 closes
+        h2_r, h2_w = await asyncio.open_connection("127.0.0.1", server.port)
+        await send_msg(h2_w, MSG_HELLO, {"network_id": net.id, "auth_token": "token123", "role": "host", "name": "Office-PC"})
+        await recv_msg(h2_r)
+
+        # 3. Old connection closes -> must NOT evict h2!
+        h1_w.close()
+        await h1_w.wait_closed()
+        await asyncio.sleep(0.1)
+        assert "Office-PC" in server.active_hosts[net.id]
+
+        # 4. Viewer connects and tests case-insensitive, 'auto', and missing-host error message
+        v_r, v_w = await asyncio.open_connection("127.0.0.1", server.port)
+        await send_msg(v_w, MSG_HELLO, {"network_id": net.id, "auth_token": "token123", "role": "viewer", "name": "ELKAR"})
+        await recv_msg(v_r)
+
+        await send_msg(v_w, MSG_TUNNEL_REQUEST, {"target_host": "office-pc"})
+        m_type, p = await recv_msg(v_r)
+        assert m_type == MSG_TUNNEL_START
+        await recv_msg(h2_r)  # drain assign
+
+        await send_msg(v_w, MSG_TUNNEL_REQUEST, {"target_host": "auto"})
+        m_type, p = await recv_msg(v_r)
+        assert m_type == MSG_TUNNEL_START
+        await recv_msg(h2_r)  # drain assign
+
+        await send_msg(v_w, MSG_TUNNEL_REQUEST, {"target_host": "WrongName"})
+        m_type, p = await recv_msg(v_r)
+        assert m_type == MSG_TUNNEL_ERROR
+        assert "Office-PC" in p["message"]
+
+        h2_w.close()
+        v_w.close()
+        await h2_w.wait_closed()
+        await v_w.wait_closed()
+    finally:
+        await server.stop()

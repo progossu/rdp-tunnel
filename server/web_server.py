@@ -120,15 +120,18 @@ class WebServer:
     ) -> Dict[str, str]:
         """Generates CLI commands and INI contents for Host or Viewer configuration."""
         clean_role = "viewer" if role.lower() == "viewer" else "host"
+        is_auto_name = not host_name or host_name.strip().lower() == "auto"
         rdp_flag = f" -rdp-port {rdp_port}" if rdp_port and rdp_port.lower() != "auto" else ""
+        host_name_flag = "" if is_auto_name else f' -name "{host_name}"'
         host_cmd = (
             f'rdp-agent.exe -server {server_addr} -net {net.id} '
-            f'-key {net.auth_token} -host -name "{host_name}"{rdp_flag}'
+            f'-key {net.auth_token} -host{host_name_flag}{rdp_flag}'
         )
         local_flag = f" -local {local_port}" if local_port and local_port != "33890" else ""
+        target_flag = ' -target "auto"' if is_auto_name else f' -target "{host_name}"'
         viewer_cmd = (
             f'rdp-agent.exe -server {server_addr} -net {net.id} '
-            f'-key {net.auth_token} -viewer -target "{host_name}"{local_flag} -mstsc'
+            f'-key {net.auth_token} -viewer{target_flag}{local_flag} -mstsc'
         )
 
         if clean_role == "viewer":
@@ -140,7 +143,7 @@ class WebServer:
                 f"key={net.auth_token}\r\n\r\n"
                 f"[node]\r\n"
                 f"role=viewer\r\n"
-                f"target={host_name}\r\n"
+                f"target={'auto' if is_auto_name else host_name}\r\n"
                 f"local_port={local_port or '33890'}\r\n"
                 f"mstsc=1\r\n"
             )
@@ -153,7 +156,7 @@ class WebServer:
                 f"key={net.auth_token}\r\n\r\n"
                 f"[node]\r\n"
                 f"role=host\r\n"
-                f"name={host_name}\r\n"
+                f"name={'' if is_auto_name else host_name}\r\n"
                 f"rdp_port={rdp_port or 'auto'}\r\n"
             )
 

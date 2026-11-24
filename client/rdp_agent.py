@@ -398,6 +398,8 @@ async def main_async() -> None:
     role = "host" if args.host else ("viewer" if args.viewer else ini_cfg.get("role", "host"))
     name = args.name or ini_cfg.get("name") or socket.gethostname()
     target = args.target or ini_cfg.get("target")
+    if target and target.strip().lower() == "auto":
+        target = None
     local_port = args.local if args.local != 33890 else (ini_cfg.get("local_port") or 33890)
     rdp_port = args.rdp_port if args.rdp_port is not None else ini_cfg.get("rdp_port", 0)
     if rdp_port == 0:

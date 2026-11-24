@@ -1288,6 +1288,11 @@ proc load_ini_config
     invoke  GetPrivateProfileStringA, szSecNode, szKeyRole, szDefRole, role_buf, 31, config_path
     invoke  GetPrivateProfileStringA, szSecNode, szKeyName, szEmpty, name_buf, 127, config_path
     invoke  GetPrivateProfileStringA, szSecNode, szKeyTarget, szEmpty, target_buf, 127, config_path
+    cinvoke _stricmp, target_buf, szAuto
+    test    eax, eax
+    jnz     .ini_local
+    mov     byte [target_buf], 0
+.ini_local:
     invoke  GetPrivateProfileIntA, szSecNode, szKeyLocalPort, 33890, config_path
     mov     [local_port], eax
 
@@ -1441,6 +1446,11 @@ proc apply_cli_overrides
     pop     edx
     pop     ecx
     cinvoke strncpy, target_buf, ecx, 120
+    cinvoke _stricmp, target_buf, szAuto
+    test    eax, eax
+    jnz     .target_inc
+    mov     byte [target_buf], 0
+.target_inc:
     inc     dword [i]
     jmp     .next
 

@@ -282,20 +282,35 @@ class RelayServer:
             await active_node.send_frame(MSG_HEARTBEAT, {})
 
         elif msg_type == MSG_TUNNEL_REQUEST:
-            target_host = payload.get("target_host") or payload.get("host")
+            target_host = (payload.get("target_host") or payload.get("host") or "").strip()
             hosts_in_net = self.active_hosts.get(active_node.network_id, {})
 
             chosen_host: Optional[ActiveNode] = None
-            if target_host:
+            if target_host and target_host.lower() != "auto":
                 chosen_host = hosts_in_net.get(target_host)
+                if chosen_host is None:
+                    # Case-insensitive fallback lookup
+                    target_lower = target_host.lower()
+                    for h_name, h_node in hosts_in_net.items():
+                        if h_name.lower() == target_lower:
+                            chosen_host = h_node
+                            break
             else:
                 if len(hosts_in_net) == 1:
                     chosen_host = next(iter(hosts_in_net.values()))
 
             if chosen_host is None:
+                if not hosts_in_net:
+                    err_msg = f"Target host '{target_host or 'auto'}' is offline (no hosts online in network)"
+                elif not target_host or target_host.lower() == "auto":
+                    online_names = ", ".join(sorted(hosts_in_net.keys()))
+                    err_msg = f"Multiple hosts online ({online_names}); specify -target <name>"
+                else:
+                    online_names = ", ".join(sorted(hosts_in_net.keys()))
+                    err_msg = f"Target host '{target_host}' is offline (online hosts: {online_names})"
                 await active_node.send_frame(
                     MSG_TUNNEL_ERROR,
-                    {"error_code": "HOST_OFFLINE", "message": "Target host is offline"},
+                    {"error_code": "HOST_OFFLINE", "message": err_msg},
                 )
             else:
                 session_token = secrets.token_hex(16)
@@ -329,7 +344,9 @@ class RelayServer:
         net_id = active_node.network_id
         if active_node.role == "host":
             if net_id in self.active_hosts:
-                self.active_hosts[net_id].pop(active_node.name, None)
+                # Only remove if this exact ActiveNode instance is still the registered one
+                if self.active_hosts[net_id].get(active_node.name) is active_node:
+                    self.active_hosts[net_id].pop(active_node.name, None)
                 if not self.active_hosts[net_id]:
                     self.active_hosts.pop(net_id, None)
         elif active_node.role == "viewer":
