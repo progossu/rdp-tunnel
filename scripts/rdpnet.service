@@ -1,0 +1,15 @@
+[Unit]
+Description=RdpNet Isolated RDP Reverse Tunnel & Web Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/rdpnet
+ExecStart=/usr/bin/python3 -m server.main --host 0.0.0.0 --relay-port 8443 --web-port 8080 --data-file /opt/rdpnet/networks.json
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
