@@ -43,7 +43,8 @@ mkdir -p "${INSTALL_DIR}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Copy server code
+# Clean copy server code to avoid nested directories on updates
+rm -rf "${INSTALL_DIR}/server" "${INSTALL_DIR}/client"
 cp -r "${SCRIPT_DIR}/server" "${INSTALL_DIR}/"
 cp -r "${SCRIPT_DIR}/client" "${INSTALL_DIR}/" 2>/dev/null || true
 
@@ -93,6 +94,9 @@ if systemctl is-active --quiet rdpnet; then
     echo "  journalctl -u rdpnet -f"
     echo ""
 else
-    echo -e "${RED}[!] Error: rdpnet service failed to start. Check logs with: journalctl -u rdpnet -e${NC}"
+    echo -e "${RED}[!] Error: rdpnet service failed to start. Showing recent logs:${NC}"
+    echo "----------------------------------------------------"
+    journalctl -u rdpnet -n 25 --no-pager || true
+    echo "----------------------------------------------------"
     exit 1
 fi

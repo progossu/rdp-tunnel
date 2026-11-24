@@ -6,6 +6,8 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/rdpnet
+Environment=PYTHONPATH=/opt/rdpnet
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -m server.main --host 0.0.0.0 --relay-port 8443 --web-port 8080 --data-file /opt/rdpnet/networks.json
 Restart=always
 RestartSec=3
